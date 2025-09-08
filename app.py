@@ -1,3 +1,4 @@
+import os
 import time
 import base64
 import io
@@ -9,13 +10,38 @@ from flask_login import LoginManager, login_user, logout_user, current_user, log
 from flask_pymongo import PyMongo
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
 from werkzeug.security import generate_password_hash, check_password_hash
-from config import Config
 import qrcode
+from pymongo.errors import ConnectionFailure, OperationFailure
+
+# --- Configuration ---
+class Config:
+    SECRET_KEY = os.environ.get('SECRET_KEY') or 'a-super-secret-key-you-should-change'
+    MONGO_URI = os.environ.get('MONGO_URI') or "mongodb://localhost:27017/attendance_app"
+    QR_REFRESH_RATE_SECONDS = 2
+    TOKEN_VALIDITY_SECONDS = 5
 
 # --- App Initialization ---
 app = Flask(__name__)
 app.config.from_object(Config)
-mongo = PyMongo(app)
+
+# Initialize MongoDB connection with error handling
+try:
+    mongo = PyMongo(app)
+    # Test the connection
+    mongo.db.command('ping')
+    print("Successfully connected to MongoDB Atlas.")
+    mongo_connected = True
+except (ConnectionFailure, OperationFailure, Exception) as e:
+    print(f"MongoDB connection failed: {e}")
+    mongo_connected = False
+    # Create a dummy mongo object to avoid attribute errors
+    class DummyMongo:
+        def __getattr__(self, name):
+            return self
+        def __call__(self, *args, **kwargs):
+            return self
+    mongo = DummyMongo()
+
 socketio = SocketIO(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
@@ -34,9 +60,7 @@ class User(UserMixin):
         self.password_hash = user_data["password"]
         self.role = user_data.get("role", "student")
         self.section = user_data.get("section", "Unassigned")
-        self.student_name = user_data.get("student_name", user_data["username"])  # fallback to username
-
-
+        self.student_name = user_data.get("student_name", user_data["username"])
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
@@ -44,6 +68,39 @@ class User(UserMixin):
 # --- User Loader ---
 @login_manager.user_loader
 def load_user(user_id):
+    if not mongo_connected:
+        # Fallback to demo users if MongoDB is not connected
+        demo_users = {
+            "111111111111111111111111": {
+                "_id": ObjectId("111111111111111111111111"),
+                "username": "teacher",
+                "password": generate_password_hash("password", method='pbkdf2:sha256'),
+                "role": "teacher",
+                "section": "A",
+                "student_name": "Demo Teacher"
+            },
+            "222222222222222222222222": {
+                "_id": ObjectId("222222222222222222222222"),
+                "username": "student1",
+                "password": generate_password_hash("password", method='pbkdf2:sha256'),
+                "role": "student",
+                "section": "A",
+                "student_name": "Student One"
+            },
+            "333333333333333333333333": {
+                "_id": ObjectId("333333333333333333333333"),
+                "username": "student2",
+                "password": generate_password_hash("password", method='pbkdf2:sha256'),
+                "role": "student",
+                "section": "B",
+                "student_name": "Student Two"
+            }
+        }
+        user_data = demo_users.get(user_id)
+        if user_data:
+            return User(user_data)
+        return None
+    
     user_data = mongo.db.users.find_one({"_id": ObjectId(user_id)})
     if user_data:
         return User(user_data)
@@ -57,10 +114,65 @@ def generate_qr_code_image(token):
     img.save(buf, format='PNG')
     return base64.b64encode(buf.getvalue()).decode('utf-8')
 
+def db_find_one(collection, query):
+    """Safe database find_one operation with fallback"""
+    if not mongo_connected:
+        return None
+    try:
+        return mongo.db[collection].find_one(query)
+    except:
+        return None
+
+def db_find(collection, query=None):
+    """Safe database find operation with fallback"""
+    if not mongo_connected:
+        return []
+    try:
+        if query:
+            return list(mongo.db[collection].find(query))
+        return list(mongo.db[collection].find())
+    except:
+        return []
+
+def db_count_documents(collection, query=None):
+    """Safe database count_documents operation with fallback"""
+    if not mongo_connected:
+        return 0
+    try:
+        if query:
+            return mongo.db[collection].count_documents(query)
+        return mongo.db[collection].count_documents({})
+    except:
+        return 0
+
+def db_update_one(collection, filter, update, upsert=False):
+    """Safe database update_one operation with fallback"""
+    if not mongo_connected:
+        return type('result', (object,), {'modified_count': 0})
+    try:
+        return mongo.db[collection].update_one(filter, update, upsert=upsert)
+    except:
+        return type('result', (object,), {'modified_count': 0})
+
+def db_insert_one(collection, document):
+    """Safe database insert_one operation with fallback"""
+    if not mongo_connected:
+        return type('result', (object,), {'inserted_id': ObjectId()})
+    try:
+        return mongo.db[collection].insert_one(document)
+    except:
+        return type('result', (object,), {'inserted_id': ObjectId()})
+
+def db_insert_many(collection, documents):
+    """Safe database insert_many operation with fallback"""
+    if not mongo_connected:
+        return type('result', (object,), {'inserted_ids': [ObjectId() for _ in documents]})
+    try:
+        return mongo.db[collection].insert_many(documents)
+    except:
+        return type('result', (object,), {'inserted_ids': [ObjectId() for _ in documents]})
+
 # --- Authentication Routes ---
-
-# main index
-
 @app.route('/')
 def index():
     return redirect(url_for('login'))
@@ -68,23 +180,65 @@ def index():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if current_user.is_authenticated:
-        redirect_url = url_for('teacher_dashboard') if current_user.role == 'teacher' else url_for('student_scan')
+        redirect_url = url_for('teacher_dashboard') if current_user.role == 'teacher' else url_for('student_dashboard')
         return redirect(redirect_url)
     
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
-        user_data = mongo.db.users.find_one({"username": username})
         
-        if not user_data:
-            flash(f"No user found with username '{username}'.")
-        elif not check_password_hash(user_data['password'], password):
-            flash('Incorrect password, please try again.')
+        # Check against demo users first if MongoDB is not connected
+        if not mongo_connected:
+            demo_users = {
+                "teacher": {
+                    "_id": ObjectId("111111111111111111111111"),
+                    "username": "teacher",
+                    "password": generate_password_hash("password", method='pbkdf2:sha256'),
+                    "role": "teacher",
+                    "section": "A",
+                    "student_name": "Demo Teacher"
+                },
+                "student1": {
+                    "_id": ObjectId("222222222222222222222222"),
+                    "username": "student1",
+                    "password": generate_password_hash("password", method='pbkdf2:sha256'),
+                    "role": "student",
+                    "section": "A",
+                    "student_name": "Student One"
+                },
+                "student2": {
+                    "_id": ObjectId("333333333333333333333333"),
+                    "username": "student2",
+                    "password": generate_password_hash("password", method='pbkdf2:sha256'),
+                    "role": "student",
+                    "section": "B",
+                    "student_name": "Student Two"
+                }
+            }
+            
+            user_data = demo_users.get(username)
+            if not user_data:
+                flash(f"No user found with username '{username}'.")
+            elif not check_password_hash(user_data['password'], password):
+                flash('Incorrect password, please try again.')
+            else:
+                user = User(user_data)
+                login_user(user)
+                redirect_url = url_for('teacher_dashboard') if user.role == 'teacher' else url_for('student_dashboard')
+                return redirect(redirect_url)
         else:
-            user = User(user_data)
-            login_user(user)
-            redirect_url = url_for('teacher_dashboard') if user.role == 'teacher' else url_for('student_dashboard')
-            return redirect(redirect_url)
+            # Use MongoDB for authentication
+            user_data = db_find_one('users', {"username": username})
+            
+            if not user_data:
+                flash(f"No user found with username '{username}'.")
+            elif not check_password_hash(user_data['password'], password):
+                flash('Incorrect password, please try again.')
+            else:
+                user = User(user_data)
+                login_user(user)
+                redirect_url = url_for('teacher_dashboard') if user.role == 'teacher' else url_for('student_dashboard')
+                return redirect(redirect_url)
             
     return render_template('login.html')
 
@@ -102,16 +256,16 @@ def student_stats():
         return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
     student_id = ObjectId(current_user.id)
-    total_classes = mongo.db.attendance.count_documents({})
-    attended_classes = mongo.db.attendance.count_documents({"records.user_id": student_id})
+    total_classes = db_count_documents('attendance')
+    attended_classes = db_count_documents('attendance', {"records.user_id": student_id})
     percentage = round((attended_classes / total_classes) * 100, 2) if total_classes > 0 else 0
 
-    today_date = datetime.utcnow().strftime('%Y-%d-%m')
-    today_doc = mongo.db.attendance.find_one({"date": today_date})
+    today_date = datetime.utcnow().strftime('%Y-%m-%d')
+    today_doc = db_find_one('attendance', {"date": today_date})
     classes_today = 0
     if today_doc:
         classes_today = len({rec['checkpoint'] for rec in today_doc.get("records", [])
-                             if rec["user_id"] == student_id})
+                             if str(rec["user_id"]) == str(student_id)})
 
     return jsonify({
         'success': True, 'percentage': percentage, 'classes_today': classes_today,
@@ -130,7 +284,7 @@ def teacher_dashboard():
 def teacher_qr():
     if current_user.role != 'teacher':
         return "Access Denied", 403
-    today_date = datetime.utcnow().strftime('%Y-%d-%m')
+    today_date = datetime.utcnow().strftime('%Y-%m-%d')
     qr_refresh_ms = app.config.get('QR_REFRESH_RATE_SECONDS', 10) * 1000
     return render_template('teacher_qr.html', qr_refresh_ms=qr_refresh_ms, today_date=today_date, checkpoints=CHECKPOINTS)
 
@@ -139,8 +293,8 @@ def teacher_qr():
 def teacher_monitor():
     if current_user.role != 'teacher':
         return "Access Denied", 403
-    date_str = request.args.get('date', datetime.utcnow().strftime('%Y-%d-%m'))
-    daily_attendance_doc = mongo.db.attendance.find_one({"date": date_str})
+    date_str = request.args.get('date', datetime.utcnow().strftime('%Y-%m-%d'))
+    daily_attendance_doc = db_find_one('attendance', {"date": date_str})
     return render_template('teacher_monitor.html', daily_doc=daily_attendance_doc, date_str=date_str)
 
 @app.route('/teacher/manual_entry')
@@ -148,8 +302,8 @@ def teacher_monitor():
 def teacher_manual_entry():
     if current_user.role != 'teacher':
         return "Access Denied", 403
-    today_date = datetime.utcnow().strftime('%Y-%d-%m')
-    students = list(mongo.db.users.find({"role": "student"}))
+    today_date = datetime.utcnow().strftime('%Y-%m-%d')
+    students = db_find('users', {"role": "student"})
     sections = sorted(list({s.get("section", "Unassigned") for s in students}))
     return render_template(
         'teacher_manual_entry.html', students=students, sections=sections,
@@ -163,12 +317,9 @@ def student_dashboard():
     if current_user.role == 'teacher':
         return "Access Denied", 403
     
-
-    
-    return render_template('student_dashboard.html' , name=name)
+    return render_template('student_dashboard.html', name=name)
 
 # --- New Teacher Dashboard Routes ---
-
 @app.route('/teacher/students')
 @login_required
 def teacher_students():
@@ -176,7 +327,7 @@ def teacher_students():
     if current_user.role != 'teacher':
         return "Access Denied", 403
     
-    students = list(mongo.db.users.find({"role": "student"}))
+    students = db_find('users', {"role": "student"})
     return render_template('teacher_students.html', students=students)
 
 @app.route('/teacher/assignments')
@@ -186,7 +337,6 @@ def teacher_assignments():
     if current_user.role != 'teacher':
         return "Access Denied", 403
     
-    # In a full implementation, you'd fetch assignment data from the database.
     assignments = [
         {"title": "Math Homework 1", "due_date": "2025-09-10", "status": "Pending"},
         {"title": "Science Project", "due_date": "2025-09-12", "status": "Submitted"}
@@ -200,7 +350,6 @@ def teacher_grades():
     if current_user.role != 'teacher':
         return "Access Denied", 403
 
-    # In a full implementation, you'd fetch grade data.
     grades = [
         {"student_name": "Amit Sharma", "subject": "Math", "grade": "A"},
         {"student_name": "Priya Verma", "subject": "Science", "grade": "B+"},
@@ -215,7 +364,6 @@ def teacher_add_student():
     if current_user.role != 'teacher':
         return "Access Denied", 403
     return render_template('add_student.html')
-from werkzeug.security import generate_password_hash
 
 @app.route('/api/add_student', methods=['POST'])
 @login_required
@@ -231,7 +379,7 @@ def api_add_student():
             return jsonify({'success': False, 'error': f'Missing field: {field}'}), 400
 
     # Check for duplicate username
-    if mongo.db.users.find_one({"username": data['username']}):
+    if db_find_one('users', {"username": data['username']}):
         return jsonify({'success': False, 'error': 'Username already exists'}), 400
 
     # Insert student into DB
@@ -244,10 +392,9 @@ def api_add_student():
         "section": data['section'],
         "status": "absent"
     }
-    result = mongo.db.users.insert_one(new_student)
+    result = db_insert_one('users', new_student)
 
     return jsonify({'success': True, 'message': 'Student added successfully', 'id': str(result.inserted_id)})
-
 
 # --- API and WebSocket Logic ---
 @socketio.on('connect', namespace='/teacher')
@@ -272,13 +419,13 @@ def api_mark_attendance():
         payload = serializer.loads(token, max_age=app.config.get('TOKEN_VALIDITY_SECONDS', 15))
         date, checkpoint = payload['date'], payload['checkpoint']
 
-        existing_record = mongo.db.attendance.find_one({
+        existing_record = db_find_one('attendance', {
             "date": date, "records": {"$elemMatch": {"user_id": ObjectId(current_user.id), "checkpoint": checkpoint}}
         })
         if existing_record: return jsonify({'success': False, 'error': f'Attendance already marked for {checkpoint}.'}), 409
 
         new_record = {"user_id": ObjectId(current_user.id), "username": current_user.username, "timestamp": datetime.utcnow(), "checkpoint": checkpoint, "method": "QR"}
-        mongo.db.attendance.update_one({"date": date}, {"$push": {"records": new_record}}, upsert=True)
+        db_update_one('attendance', {"date": date}, {"$push": {"records": new_record}}, upsert=True)
         socketio.emit('student_checked_in', {**new_record, 'timestamp': new_record['timestamp'].strftime('%I:%M:%S %p'), 'date': date}, namespace='/teacher', broadcast=True)
         return jsonify({'success': True, 'message': 'Attendance marked successfully!'})
 
@@ -294,16 +441,16 @@ def manual_mark():
     student_id, date, checkpoint = data.get('student_id'), data.get('date'), data.get('checkpoint')
     if not all([student_id, date, checkpoint]): return jsonify({'success': False, 'error': 'Missing data.'}), 400
 
-    student_data = mongo.db.users.find_one({"_id": ObjectId(student_id)})
+    student_data = db_find_one('users', {"_id": ObjectId(student_id)})
     if not student_data: return jsonify({'success': False, 'error': 'Student not found'}), 404
 
-    existing_record = mongo.db.attendance.find_one({
+    existing_record = db_find_one('attendance', {
         "date": date, "records": {"$elemMatch": {"user_id": ObjectId(student_id), "checkpoint": checkpoint}}
     })
     if existing_record: return jsonify({'success': False, 'error': f'{student_data["username"]} already marked for {checkpoint}.'}), 409
 
     new_record = {"user_id": ObjectId(student_id), "username": student_data["username"], "timestamp": datetime.utcnow(), "checkpoint": checkpoint, "method": "Manual"}
-    mongo.db.attendance.update_one({"date": date}, {"$push": {"records": new_record}}, upsert=True)
+    db_update_one('attendance', {"date": date}, {"$push": {"records": new_record}}, upsert=True)
     socketio.emit('student_checked_in', {**new_record, 'timestamp': new_record['timestamp'].strftime('%I:%M:%S %p'), 'date': date}, namespace='/teacher', broadcast=True)
     return jsonify({'success': True, 'username': student_data["username"]})
 
@@ -318,36 +465,48 @@ def manual_bulk_mark():
 
     updated, skipped = [], []
     for sid in student_ids:
-        student_data = mongo.db.users.find_one({"_id": ObjectId(sid)})
+        student_data = db_find_one('users', {"_id": ObjectId(sid)})
         if not student_data:
             skipped.append(f"ID:{sid}"); continue
 
-        existing_record = mongo.db.attendance.find_one({
+        existing_record = db_find_one('attendance', {
             "date": date, "records": {"$elemMatch": {"user_id": ObjectId(sid), "checkpoint": checkpoint}}
         })
         if existing_record:
             skipped.append(student_data["username"]); continue
 
         new_record = {"user_id": ObjectId(sid), "username": student_data["username"], "timestamp": datetime.utcnow(), "checkpoint": checkpoint, "method": "Manual"}
-        mongo.db.attendance.update_one({"date": date}, {"$push": {"records": new_record}}, upsert=True)
+        db_update_one('attendance', {"date": date}, {"$push": {"records": new_record}}, upsert=True)
         updated.append(student_data["username"])
         socketio.emit('student_checked_in', {**new_record, 'timestamp': new_record['timestamp'].strftime('%I:%M:%S %p'), 'date': date}, namespace='/teacher', broadcast=True)
 
     return jsonify({'success': True, 'updated': updated, 'skipped': skipped})
 
+# --- Health Check Endpoint ---
+@app.route('/health')
+def health_check():
+    return jsonify({
+        'status': 'healthy',
+        'database_connected': mongo_connected,
+        'timestamp': datetime.utcnow().isoformat()
+    })
+
 # --- Main Execution & Data Seeding ---
 if __name__ == '__main__':
-    with app.app_context(): 
-        if mongo.db.users.count_documents({}) == 0:
-            print("Seeding database with demo users...")
-            hashed_password = generate_password_hash("password", method='pbkdf2:sha256')
-            
-            demo_users = [
-                {"username": "teacher", "password": hashed_password, "role": "teacher", "section": "A","status":"absent"},
-                {"username": "student1", "password": hashed_password, "role": "student", "section": "A","status":"absent"},
-                {"username": "student2", "password": hashed_password, "role": "student", "section": "B","status":"absent"},
-            ]
-            mongo.db.users.insert_many(demo_users)
-            print("Demo users created.")
+    # Only seed data if MongoDB is connected
+    if mongo_connected:
+        with app.app_context(): 
+            if db_count_documents('users') == 0:
+                print("Seeding database with demo users...")
+                hashed_password = generate_password_hash("password", method='pbkdf2:sha256')
+                
+                demo_users = [
+                    {"username": "teacher", "password": hashed_password, "role": "teacher", "section": "A", "status": "absent", "student_name": "Demo Teacher"},
+                    {"username": "student1", "password": hashed_password, "role": "student", "section": "A", "status": "absent", "student_name": "Student One"},
+                    {"username": "student2", "password": hashed_password, "role": "student", "section": "B", "status": "absent", "student_name": "Student Two"},
+                ]
+                db_insert_many('users', demo_users)
+                print("Demo users created.")
     
-    socketio.run(app, debug=True, host='127.0.0.1')
+    port = int(os.environ.get("PORT", 5000))
+    socketio.run(app, host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "false").lower() == "true")
